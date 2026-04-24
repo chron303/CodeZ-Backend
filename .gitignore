@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Environment
+.env
+*/.env
+backend/.env
+frontend/.env.production
+
+# Firebase
+backend/serviceAccountKey.json
+
+# Build
+frontend/build/
+*/build/
+
+# Misc
+.DS_Store
+*.log
