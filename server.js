@@ -1,13 +1,17 @@
 'use strict';
 
-// Load .env FIRST before anything else
-var dotenv = require('dotenv');
-var result = dotenv.config();
-if (result.error) {
-  console.warn('[ENV] No .env file found — using system environment variables');
-} else {
-  console.log('[ENV] Loaded .env file successfully');
-  console.log('[ENV] GITHUB_REPO =', process.env.GITHUB_REPO || '(not set)');
+// Load .env if dotenv is available (not needed on Railway — env vars are injected directly)
+try {
+  var dotenv = require('dotenv');
+  var result = dotenv.config();
+  if (result.error) {
+    console.warn('[ENV] No .env file found — using system environment variables');
+  } else {
+    console.log('[ENV] Loaded .env file successfully');
+    console.log('[ENV] GITHUB_REPO =', process.env.GITHUB_REPO || '(not set)');
+  }
+} catch (e) {
+  console.log('[ENV] dotenv not installed — using system environment variables');
 }
 
 var express       = require('express');
