@@ -6,6 +6,7 @@
 //   1. FIREBASE_SERVICE_ACCOUNT env var (JSON string) ← best for Railway
 //   2. serviceAccountKey.json file ← best for local dev
 //   3. GOOGLE_APPLICATION_CREDENTIALS path ← GCP native
+//v1.1
 
 var admin = require('firebase-admin');
 var path  = require('path');
