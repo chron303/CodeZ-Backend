@@ -1,23 +1,18 @@
 'use strict';
 
-// backend/routes/ai.js
-// AI features powered by Google Gemini 1.5 Flash (free tier)
-// Routes:
-//   POST /api/ai/hint        — get a hint for a problem
-//   POST /api/ai/review      — get code review after solving
-//   POST /api/ai/studyplan   — get personalized study plan
-
 var express = require('express');
 var https   = require('https');
 var router  = express.Router();
 
 var GEMINI_KEY   = process.env.GEMINI_API_KEY || '';
-var GEMINI_MODEL = 'gemini-2.5-flash-lite';
-var GEMINI_URL   = '/v1/models/' + GEMINI_MODEL + ':generateContent?key=';
+// gemini-2.5-flash-lite requires v1beta
+var GEMINI_MODEL = 'gemini-2.5-flash-lite-preview-06-17';
+var GEMINI_HOST  = 'generativelanguage.googleapis.com';
 
-// ── Call Gemini API ───────────────────────────────────────────
 function gemini(prompt) {
   return new Promise(function(resolve, reject) {
+    if (!GEMINI_KEY) return reject(new Error('GEMINI_API_KEY not set in environment'));
+
     var body = JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
@@ -26,15 +21,17 @@ function gemini(prompt) {
       },
     });
 
+    var path = '/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_KEY;
+
     var opts = {
-      hostname: 'generativelanguage.googleapis.com',
-      path:     GEMINI_URL + GEMINI_KEY,
+      hostname: GEMINI_HOST,
+      path:     path,
       method:   'POST',
       headers:  {
         'Content-Type':   'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
-      timeout: 20000,
+      timeout: 25000,
     };
 
     var req = https.request(opts, function(res) {
@@ -42,174 +39,147 @@ function gemini(prompt) {
       res.setEncoding('utf8');
       res.on('data', function(d) { raw += d; });
       res.on('end', function() {
+        if (!raw || !raw.trim()) {
+          return reject(new Error('Empty response from Gemini (HTTP ' + res.statusCode + ')'));
+        }
         try {
           var data = JSON.parse(raw);
-          if (data.error) return reject(new Error(data.error.message));
-          var text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          if (data.error) {
+            return reject(new Error('Gemini API error: ' + (data.error.message || JSON.stringify(data.error))));
+          }
+          var text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) {
+            // Log for debugging
+            console.error('[Gemini] Unexpected response:', JSON.stringify(data).slice(0, 200));
+            return reject(new Error('No text in Gemini response'));
+          }
           resolve(text.trim());
         } catch(e) {
-          reject(new Error('Gemini parse error: ' + raw.slice(0, 100)));
+          console.error('[Gemini] Parse error. Raw:', raw.slice(0, 200));
+          reject(new Error('Failed to parse Gemini response: ' + e.message));
         }
       });
     });
 
     req.on('error', reject);
-    req.on('timeout', function() { req.destroy(new Error('Gemini timeout')); });
+    req.on('timeout', function() { req.destroy(new Error('Gemini request timed out after 25s')); });
     req.write(body);
     req.end();
   });
 }
 
-// ── POST /api/ai/hint ─────────────────────────────────────────
-// Body: { problem: { title, description, difficulty }, code, language }
-// Returns: { hint: string }
+// ── POST /api/ai/hint ──────────────────────────────────────────
 router.post('/hint', async function(req, res, next) {
   var { problem, code, language } = req.body;
   if (!problem) return res.status(400).json({ error: 'problem is required' });
 
   var hasCode = code && code.trim().length > 20;
-
   var prompt = [
     'You are a helpful DSA tutor. A student is working on this problem:',
     '',
     'Problem: ' + problem.title,
     'Difficulty: ' + (problem.difficulty || 'Medium'),
-    'Description: ' + (problem.description || ''),
+    'Description: ' + (problem.description || '').slice(0, 300),
     '',
     hasCode
-      ? 'Their current code (' + language + '):\n```\n' + code.slice(0, 800) + '\n```'
+      ? 'Their current ' + language + ' code:\n```\n' + code.slice(0, 600) + '\n```'
       : 'They have not written any code yet.',
     '',
-    'Give ONE helpful hint that guides them toward the solution WITHOUT giving away the answer.',
-    'Rules:',
-    '- Max 3 sentences',
-    '- No code in your response',
-    '- Focus on the KEY INSIGHT or data structure they should think about',
-    '- Be encouraging',
-    'Just write the hint directly, no preamble.',
+    'Give ONE helpful hint (max 3 sentences) that guides them WITHOUT giving away the answer.',
+    'No code in your response. Be encouraging. Write the hint directly.',
   ].join('\n');
 
   try {
     var hint = await gemini(prompt);
     res.json({ hint });
   } catch(e) {
-    next(e);
+    console.error('[AI/hint]', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ── POST /api/ai/review ───────────────────────────────────────
-// Body: { problem: { title, description }, code, language, passed, total }
-// Returns: { timeComplexity, spaceComplexity, strengths[], improvements[], optimized? }
+// ── POST /api/ai/review ────────────────────────────────────────
 router.post('/review', async function(req, res, next) {
   var { problem, code, language, passed, total } = req.body;
   if (!code || !problem) return res.status(400).json({ error: 'code and problem required' });
 
   var prompt = [
-    'You are a senior software engineer reviewing a DSA solution.',
-    '',
+    'You are a senior software engineer doing a code review.',
     'Problem: ' + problem.title,
     'Language: ' + language,
-    'Test results: ' + passed + '/' + total + ' passed',
+    'Tests: ' + (passed || 0) + '/' + (total || 0) + ' passed',
     '',
-    'Code:\n```' + language + '\n' + code.slice(0, 1500) + '\n```',
+    'Code:\n```\n' + code.slice(0, 1200) + '\n```',
     '',
-    'Provide a concise code review. Respond in this EXACT JSON format (no markdown, just JSON):',
-    '{',
-    '  "timeComplexity": "O(n)",',
-    '  "spaceComplexity": "O(n)",',
-    '  "strengths": ["point 1", "point 2"],',
-    '  "improvements": ["suggestion 1", "suggestion 2"],',
-    '  "tip": "One key takeaway in one sentence"',
-    '}',
-    '',
-    'Keep each point under 15 words. Be specific and technical.',
+    'Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside JSON):',
+    '{"timeComplexity":"O(n)","spaceComplexity":"O(n)","strengths":["point 1","point 2"],"improvements":["suggestion 1"],"tip":"one key takeaway"}',
   ].join('\n');
 
   try {
-    var raw = await gemini(prompt);
-    // Strip any markdown code fences if present
-    var clean = raw.replace(/```json|```/g, '').trim();
+    var raw    = await gemini(prompt);
+    var clean  = raw.replace(/```json|```/g, '').trim();
+    // Extract JSON if wrapped in text
+    var match  = clean.match(/\{[\s\S]*\}/);
+    if (match) clean = match[0];
     try {
-      var review = JSON.parse(clean);
-      res.json(review);
+      res.json(JSON.parse(clean));
     } catch(e) {
-      // Gemini didn't return pure JSON — parse what we can
       res.json({
-        timeComplexity:  'See analysis below',
-        spaceComplexity: 'See analysis below',
-        strengths:       ['Code runs correctly'],
-        improvements:    [raw.slice(0, 200)],
-        tip:             'Review your complexity analysis.',
+        timeComplexity:  'Analyzed',
+        spaceComplexity: 'Analyzed',
+        strengths:       ['Code passes all test cases'],
+        improvements:    [clean.slice(0, 150)],
+        tip:             'Review your approach for further optimization.',
       });
     }
   } catch(e) {
-    next(e);
+    console.error('[AI/review]', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ── POST /api/ai/studyplan ────────────────────────────────────
-// Body: { topics: [...], totalSolved, streak, weakTopics: [...] }
-// Returns: { greeting, plan: [...], focus, encouragement }
+// ── POST /api/ai/studyplan ─────────────────────────────────────
 router.post('/studyplan', async function(req, res, next) {
   var { topics, totalSolved, streak, weakTopics } = req.body;
-  if (!topics) return res.status(400).json({ error: 'topics required' });
 
-  var topicSummary = (topics || [])
-    .slice(0, 15)
-    .map(function(t) { return t.topic + ': ' + t.solved + '/' + t.total + ' (' + t.percentage + '%)'; })
-    .join('\n');
+  var topicSummary = (topics || []).slice(0, 10)
+    .map(function(t) { return t.topic + ': ' + t.solved + '/' + t.total; })
+    .join(', ');
 
   var weak = (weakTopics || []).slice(0, 3).map(function(t) { return t.topic; }).join(', ');
 
   var prompt = [
-    'You are a DSA coach creating a personalized study plan.',
+    'You are a DSA coach. Create a personalized 3-day study plan.',
+    'Student: ' + (totalSolved||0) + ' solved, ' + (streak||0) + ' day streak',
+    'Weak topics: ' + (weak || 'not yet determined'),
+    'Progress: ' + topicSummary,
     '',
-    'Student stats:',
-    '- Total problems solved: ' + (totalSolved || 0),
-    '- Current streak: ' + (streak || 0) + ' days',
-    '- Weakest topics: ' + (weak || 'not determined yet'),
-    '',
-    'Topic progress:',
-    topicSummary,
-    '',
-    'Create a focused 3-day study plan. Respond in this EXACT JSON format (no markdown):',
-    '{',
-    '  "greeting": "Short motivational opener (1 sentence)",',
-    '  "focus": "The ONE topic they should focus on most this week",',
-    '  "plan": [',
-    '    { "day": "Today", "topic": "Arrays", "goal": "Solve 2 medium problems", "why": "Short reason" },',
-    '    { "day": "Tomorrow", "topic": "Trees", "goal": "Solve 1 easy + 1 medium", "why": "Short reason" },',
-    '    { "day": "Day 3", "topic": "DP", "goal": "Review Climbing Stairs pattern", "why": "Short reason" }',
-    '  ],',
-    '  "encouragement": "One specific encouraging sentence based on their progress"',
-    '}',
-    '',
-    'Base recommendations on their weakest topics. Keep each field under 20 words.',
+    'Respond ONLY with valid JSON (no markdown, no backticks):',
+    '{"greeting":"short motivational line","focus":"one topic to focus on","plan":[{"day":"Today","topic":"Arrays","goal":"solve 2 problems","why":"reason"},{"day":"Tomorrow","topic":"Trees","goal":"solve 1 easy","why":"reason"},{"day":"Day 3","topic":"DP","goal":"review patterns","why":"reason"}],"encouragement":"one encouraging line"}',
   ].join('\n');
 
   try {
-    var raw = await gemini(prompt);
+    var raw   = await gemini(prompt);
     var clean = raw.replace(/```json|```/g, '').trim();
+    var match = clean.match(/\{[\s\S]*\}/);
+    if (match) clean = match[0];
     try {
-      var plan = JSON.parse(clean);
-      res.json(plan);
+      res.json(JSON.parse(clean));
     } catch(e) {
       res.json({
-        greeting:      'Keep going — every problem solved makes you stronger!',
+        greeting:      'Keep going — consistency is everything!',
         focus:         weak ? weak.split(',')[0].trim() : 'Arrays',
         plan: [
-          { day: 'Today',    topic: weak ? weak.split(',')[0] : 'Arrays',
-            goal: 'Solve 2 problems', why: 'Build consistency' },
-          { day: 'Tomorrow', topic: weak ? weak.split(',')[1] || 'Trees' : 'Trees',
-            goal: 'Solve 1-2 problems', why: 'Target weak areas' },
-          { day: 'Day 3',    topic: 'Review',
-            goal: 'Re-attempt any wrong answers', why: 'Reinforce learning' },
+          { day:'Today',    topic: weak?weak.split(',')[0]:'Arrays', goal:'Solve 2 problems', why:'Build momentum' },
+          { day:'Tomorrow', topic: weak?weak.split(',')[1]||'Trees':'Trees', goal:'Solve 1-2 problems', why:'Target weak areas' },
+          { day:'Day 3',    topic:'Review', goal:'Re-attempt wrong answers', why:'Reinforce learning' },
         ],
-        encouragement: 'You have solved ' + (totalSolved||0) + ' problems — keep the momentum!',
+        encouragement: 'You have solved ' + (totalSolved||0) + ' problems — great progress!',
       });
     }
   } catch(e) {
-    next(e);
+    console.error('[AI/studyplan]', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 

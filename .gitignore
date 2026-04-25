@@ -18,3 +18,5 @@ frontend/build/
 # Misc
 .DS_Store
 *.log
+
+serviceAccountKey.json
