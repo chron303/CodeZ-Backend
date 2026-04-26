@@ -184,3 +184,13 @@ router.post('/studyplan', async function(req, res, next) {
 });
 
 module.exports = router;
+
+// ── GET /api/ai/test ── quick diagnostic, no auth needed
+router.get('/test', async function(req, res) {
+  var key = GEMINI_KEY ? GEMINI_KEY.slice(0,8) + '...' : 'NOT SET';
+  res.json({
+    model:  GEMINI_MODEL,
+    keySet: !!GEMINI_KEY,
+    keyHint: key,
+  });
+});
