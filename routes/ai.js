@@ -194,3 +194,13 @@ router.get('/test', async function(req, res) {
     keyHint: key,
   });
 });
+
+// ── GET /api/ai/testcall ── actually calls Gemini and returns raw result
+router.get('/testcall', async function(req, res) {
+  try {
+    var result = await gemini('Say hello in exactly 3 words.');
+    res.json({ success: true, response: result });
+  } catch(e) {
+    res.json({ success: false, error: e.message });
+  }
+});
