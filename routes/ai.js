@@ -6,7 +6,7 @@ var router  = express.Router();
 
 var GEMINI_KEY   = process.env.GEMINI_API_KEY || '';
 // gemini-2.5-flash-lite requires v1beta
-var GEMINI_MODEL = 'gemini-2.5-flash-lite-preview-06-17';
+var GEMINI_MODEL = 'gemini-2.5-flash';
 var GEMINI_HOST  = 'generativelanguage.googleapis.com';
 
 function gemini(prompt) {
