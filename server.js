@@ -1,17 +1,13 @@
 'use strict';
 
-// Load .env if dotenv is available (not needed on Railway — env vars are injected directly)
-try {
-  var dotenv = require('dotenv');
-  var result = dotenv.config();
-  if (result.error) {
-    console.warn('[ENV] No .env file found — using system environment variables');
-  } else {
-    console.log('[ENV] Loaded .env file successfully');
-    console.log('[ENV] GITHUB_REPO =', process.env.GITHUB_REPO || '(not set)');
-  }
-} catch (e) {
-  console.log('[ENV] dotenv not installed — using system environment variables');
+// Load .env FIRST before anything else
+var dotenv = require('dotenv');
+var result = dotenv.config();
+if (result.error) {
+  console.warn('[ENV] No .env file found — using system environment variables');
+} else {
+  console.log('[ENV] Loaded .env file successfully');
+  console.log('[ENV] GITHUB_REPO =', process.env.GITHUB_REPO || '(not set)');
 }
 
 var express       = require('express');
@@ -31,14 +27,20 @@ var PORT = process.env.PORT || 4000;
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc)
+    // Allow requests with no origin (curl, Postman, mobile apps)
     if (!origin) return callback(null, true);
-    var allowed = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
-      .split(',').map(function(s) { return s.trim(); });
-    if (allowed.indexOf(origin) !== -1 || allowed.indexOf('*') !== -1) {
+    // Always allow localhost in any form
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       return callback(null, true);
     }
-    callback(new Error('Not allowed by CORS'));
+    // Check allowed origins from env
+    var allowed = (process.env.ALLOWED_ORIGINS || '')
+      .split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    if (allowed.length === 0 || allowed.indexOf(origin) !== -1 || allowed.indexOf('*') !== -1) {
+      return callback(null, true);
+    }
+    console.error('[CORS] Blocked origin:', origin, '| Allowed:', allowed.join(', '));
+    callback(new Error('Not allowed by CORS: ' + origin));
   },
   credentials: true,
 }));
