@@ -77,12 +77,16 @@ router.post('/create-order', async function(req, res) {
 // ── POST /api/premium/verify ───────────────────────────────────
 router.post('/verify', async function(req, res) {
   var { razorpay_order_id, razorpay_payment_id, razorpay_signature, uid, plan } = req.body;
+  console.log('[Premium] Verify called for uid:', uid, 'plan:', plan);
+  console.log('[Premium] Keys set - KEY_ID:', !!RZP_KEY_ID, 'SECRET:', !!RZP_KEY_SECRET);
 
   // Verify HMAC
   var body      = razorpay_order_id + '|' + razorpay_payment_id;
   var expected  = crypto.createHmac('sha256', RZP_KEY_SECRET).update(body).digest('hex');
+  console.log('[Premium] Signature match:', expected === razorpay_signature);
   if (expected !== razorpay_signature) {
-    return res.status(400).json({ error: 'Payment verification failed.' });
+    console.error('[Premium] Signature MISMATCH - expected:', expected.slice(0,10), 'got:', razorpay_signature?.slice(0,10));
+    return res.status(400).json({ error: 'Payment verification failed - signature mismatch.' });
   }
 
   var p   = PLANS[plan] || PLANS.monthly;
