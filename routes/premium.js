@@ -9,6 +9,12 @@ var admin    = require('../firebaseAdmin');
 var RZP_KEY_ID     = process.env.RAZORPAY_KEY_ID     || '';
 var RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
 
+// Log on startup to verify keys exist (only show first 8 chars)
+if (RZP_KEY_ID)     console.log('[Razorpay] KEY_ID set:', RZP_KEY_ID.slice(0,12) + '...');
+else                console.error('[Razorpay] WARNING: RAZORPAY_KEY_ID not set!');
+if (RZP_KEY_SECRET) console.log('[Razorpay] SECRET set:', RZP_KEY_SECRET.slice(0,4) + '...');
+else                console.error('[Razorpay] WARNING: RAZORPAY_KEY_SECRET not set!');
+
 var PLANS = {
   monthly: { amount: 9900,  currency: 'INR', description: 'DSA Quest Premium — 1 Month',  days: 30  },
   yearly:  { amount: 79900, currency: 'INR', description: 'DSA Quest Premium — 1 Year',   days: 365 },
@@ -60,7 +66,10 @@ router.post('/create-order', async function(req, res) {
       notes:    { uid, plan },
     });
     if (result.status !== 200) {
-      return res.status(500).json({ error: 'Could not create order: ' + JSON.stringify(result.data) });
+      console.error('[Razorpay] Create order failed:', JSON.stringify(result.data));
+      return res.status(500).json({
+        error: 'Could not create order: ' + (result.data?.error?.description || JSON.stringify(result.data))
+      });
     }
     res.json({
       orderId:     result.data.id,
@@ -204,6 +213,18 @@ router.post('/admin-grant', async function(req, res) {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── GET /api/premium/check-keys ── admin diagnostic
+router.get('/check-keys', function(req, res) {
+  res.json({
+    keyIdSet:     !!RZP_KEY_ID,
+    secretSet:    !!RZP_KEY_SECRET,
+    keyIdLength:  RZP_KEY_ID.trim().length,
+    secretLength: RZP_KEY_SECRET.trim().length,
+    keyIdPrefix:  RZP_KEY_ID.trim().slice(0, 12),
+    keyIdMode:    RZP_KEY_ID.includes('test') ? 'TEST' : RZP_KEY_ID.includes('live') ? 'LIVE' : 'UNKNOWN',
+  });
 });
 
 module.exports = router;
