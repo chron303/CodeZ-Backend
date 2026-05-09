@@ -10,30 +10,28 @@ if (result.error) {
   console.log('[ENV] GITHUB_REPO =', process.env.GITHUB_REPO || '(not set)');
 }
 
-var express       = require('express');
-var cors          = require('cors');
-var cron          = require('node-cron');
-var uploadRoute   = require('./routes/upload');
-var judgeRoute    = require('./routes/judge');
-var syncRoute     = require('./routes/sync');
-var leetcodeRoute = require('./routes/leetcode');
-var githubSync    = require('./services/githubSync');
-var aiRoute       = require('./routes/ai');
-var otpRoute      = require('./routes/otp');
-var premiumRoute  = require('./routes/premium');
+var express          = require('express');
+var cors             = require('cors');
+var cron             = require('node-cron');
+var uploadRoute      = require('./routes/upload');
+var judgeRoute       = require('./routes/judge');
+var syncRoute        = require('./routes/sync');
+var leetcodeRoute    = require('./routes/leetcode');
+var githubSync       = require('./services/githubSync');
+var reviewNotifier   = require('./services/reviewNotifier');
+var aiRoute          = require('./routes/ai');
+var otpRoute         = require('./routes/otp');
+var premiumRoute     = require('./routes/premium');
 
 var app  = express();
 var PORT = process.env.PORT || 4000;
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (curl, Postman, mobile apps)
     if (!origin) return callback(null, true);
-    // Always allow localhost in any form
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       return callback(null, true);
     }
-    // Check allowed origins from env
     var allowed = (process.env.ALLOWED_ORIGINS || '')
       .split(',').map(function(s) { return s.trim(); }).filter(Boolean);
     if (allowed.length === 0 || allowed.indexOf(origin) !== -1 || allowed.indexOf('*') !== -1) {
@@ -66,6 +64,7 @@ app.use(function(err, req, res, next) {
 app.listen(PORT, function() {
   console.log('DSA Quest API running on http://localhost:' + PORT);
 
+  // ── Cron 1: GitHub sync — daily at midnight IST ─────────────
   cron.schedule('0 0 * * *', function() {
     console.log('[Cron] Running scheduled GitHub sync...');
     githubSync.syncFromGitHub()
@@ -79,7 +78,22 @@ app.listen(PORT, function() {
 
   console.log('[Cron] GitHub sync scheduled — runs daily at midnight IST');
 
-  // Run sync on startup
+  // ── Cron 2: Review notifications — daily at 8am IST ─────────
+  cron.schedule('0 8 * * *', function() {
+    console.log('[Cron] Running review notifications...');
+    reviewNotifier.sendReviewNotifications()
+      .then(function(result) {
+        console.log('[Cron] Review notifications done —',
+          result.sent, 'sent,', result.skipped, 'skipped,', result.errors, 'errors');
+      })
+      .catch(function(err) {
+        console.error('[Cron] Review notifications failed:', err.message);
+      });
+  }, { timezone: 'Asia/Kolkata' });
+
+  console.log('[Cron] Review notifications scheduled — runs daily at 8am IST');
+
+  // ── Startup: GitHub sync ─────────────────────────────────────
   console.log('[Sync] Running initial sync on startup...');
   githubSync.syncFromGitHub()
     .then(function(log) {
