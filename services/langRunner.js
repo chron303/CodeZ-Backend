@@ -1,7 +1,13 @@
 'use strict';
 
 // backend/services/langRunner.js
-// Remote execution via Wandbox API — free, no API key needed.
+// Code execution: Python, C++, Java → all via Wandbox (free, no key needed)
+//
+// Java fix: Wandbox saves files as prog.java regardless of class name.
+// The JVM requires `public class Foo` to live in `Foo.java`.
+// Fix: strip the `public` modifier from the top-level class declaration so
+// the class name no longer needs to match the filename.
+// A non-public class compiles and runs identically for DSA problems.
 
 var https = require('https');
 
@@ -11,29 +17,35 @@ var COMPILER = {
   java:   { compiler: 'openjdk-jdk-21+35', options: '' },
 };
 
-// Java: Wandbox names the file after the public class.
-// We rename Solution → Main so filename = Main.java automatically.
+// ─── Code preparation ─────────────────────────────────────────────────────────
+
 function prepareCode(langId, code) {
-  if (langId === 'java') {
-    return code
-      .replace(/public\s+class\s+Solution\b/g, 'public class Main')
-      .replace(/\bclass\s+Solution\b/g,         'class Main');
-  }
+  if (langId !== 'java') return code;
+
+  // Step 1: rename Solution → Main (keep consistent with starter templates)
+  code = code
+    .replace(/public\s+class\s+Solution\b/g, 'public class Main')
+    .replace(/\bclass\s+Solution\b/g,         'class Main');
+
+  // Step 2: remove `public` from the top-level class so Wandbox doesn't require
+  // the filename to match. Inner classes, interfaces, enums are unaffected.
+  // This regex matches `public class Main` only at the start of a line (after
+  // optional whitespace) so it doesn't touch `public static void main(...)` etc.
+  code = code.replace(/^(\s*)public\s+(class\s+Main\b)/m, '$1$2');
+
   return code;
 }
+
+// ─── Wandbox runner ───────────────────────────────────────────────────────────
 
 function wandboxRun(langId, code, stdin) {
   return new Promise(function(resolve, reject) {
     var cfg = COMPILER[langId];
     if (!cfg) return reject(new Error('Unknown language: ' + langId));
 
-    var finalCode = prepareCode(langId, code);
-
-    // Wandbox requires top-level "code" field (always).
-    // "codes" array is for additional files — not needed here.
     var payload = {
       compiler:              cfg.compiler,
-      code:                  finalCode,
+      code:                  code,
       stdin:                 stdin || '',
       'compiler-option-raw': cfg.options,
       save:                  false,
@@ -73,6 +85,8 @@ function wandboxRun(langId, code, stdin) {
   });
 }
 
+// ─── Shared result helpers ────────────────────────────────────────────────────
+
 function norm(s) {
   if (!s) return '';
   s = String(s).replace(/\r\n/g, '\n').trim();
@@ -86,6 +100,8 @@ function fail(tc, status, error, ms) {
     actual: null, error: error, timeMs: ms,
   };
 }
+
+// ─── Per test-case runner ─────────────────────────────────────────────────────
 
 function runOne(langId, code, tc) {
   var t0    = Date.now();
@@ -124,10 +140,14 @@ function runOne(langId, code, tc) {
     });
 }
 
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 function runTests(langId, code, testCases) {
+  var finalCode = prepareCode(langId, code);
+
   return testCases.reduce(function(chain, tc) {
     return chain.then(function(acc) {
-      return runOne(langId, code, tc).then(function(r) { return acc.concat(r); });
+      return runOne(langId, finalCode, tc).then(function(r) { return acc.concat(r); });
     });
   }, Promise.resolve([]))
   .then(function(results) {

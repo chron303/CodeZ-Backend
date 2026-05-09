@@ -1,50 +1,35 @@
 'use strict';
 
-var https  = require('https');
+// backend/routes/leetcode.js
+// Fetches LeetCode stats via alfa-leetcode-api (community proxy) instead of
+// hitting leetcode.com/graphql directly — LeetCode's GraphQL blocks server-side
+// requests without a valid browser session cookie.
+//
+// Proxy base: https://alfa-leetcode-api.onrender.com
+// Endpoints used:
+//   GET /:username/solved     → { solvedProblem, easySolved, mediumSolved, hardSolved }
+//   GET /:username/submission → { submission: [{ title, titleSlug, timestamp, ... }] }
+
+var https   = require('https');
 var express = require('express');
 var router  = express.Router();
 
-// Updated query using current LeetCode GraphQL schema
-var STATS_QUERY = `
-query getUserProfile($username: String!) {
-  matchedUser(username: $username) {
-    username
-    submitStats: submitStatsGlobal {
-      acSubmissionNum {
-        difficulty
-        count
-      }
-    }
-  }
-  recentAcSubmissionList(username: $username, limit: 50) {
-    title
-    titleSlug
-    timestamp
-  }
-}`;
+var PROXY_HOST = 'alfa-leetcode-api.onrender.com';
+var TIMEOUT_MS = 20000; // proxy can be slow on Render free tier (cold start)
 
-function callLeetCode(username) {
+// ─── Generic GET helper ───────────────────────────────────────────────────────
+
+function proxyGet(path) {
   return new Promise(function(resolve, reject) {
-    var body = JSON.stringify({
-      query:     STATS_QUERY,
-      variables: { username: username },
-    });
-
     var opts = {
-      hostname: 'leetcode.com',
-      path:     '/graphql',
-      method:   'POST',
+      hostname: PROXY_HOST,
+      path:     path,
+      method:   'GET',
       headers: {
-        'Content-Type':   'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'Referer':        'https://leetcode.com',
-        'Origin':         'https://leetcode.com',
-        'User-Agent':     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept':         'application/json',
-        'Accept-Language':'en-US,en;q=0.9',
-        'x-csrftoken':    'dummy',
+        'Accept':     'application/json',
+        'User-Agent': 'dsa-quest/1.0',
       },
-      timeout: 15000,
+      timeout: TIMEOUT_MS,
     };
 
     var req = https.request(opts, function(res) {
@@ -52,77 +37,94 @@ function callLeetCode(username) {
       res.setEncoding('utf8');
       res.on('data', function(d) { raw += d; });
       res.on('end', function() {
-        console.log('[LeetCode] HTTP', res.statusCode);
-        console.log('[LeetCode] Body:', raw.slice(0, 300));
+        console.log('[LeetCode proxy] GET', path, '→ HTTP', res.statusCode);
+        if (res.statusCode === 429) {
+          return reject(Object.assign(new Error('Rate limited'), { code: 429 }));
+        }
         try {
-          resolve({ status: res.statusCode, data: JSON.parse(raw) });
+          var parsed = JSON.parse(raw);
+          resolve({ status: res.statusCode, data: parsed });
         } catch(e) {
-          reject(new Error('LeetCode invalid JSON: ' + raw.slice(0, 100)));
+          reject(new Error('Bad JSON from proxy: ' + raw.slice(0, 100)));
         }
       });
     });
 
     req.on('error', reject);
-    req.on('timeout', function() { req.destroy(new Error('Timeout')); });
-    req.write(body);
+    req.on('timeout', function() {
+      req.destroy(new Error('Proxy timed out after ' + TIMEOUT_MS + 'ms'));
+    });
     req.end();
   });
 }
 
+// ─── Route ────────────────────────────────────────────────────────────────────
+
 router.get('/:username', async function(req, res, next) {
   var username = (req.params.username || '').trim();
+
   if (!username || username.length < 2) {
     return res.status(400).json({ error: 'Username must be at least 2 characters.' });
   }
 
   try {
-    var result = await callLeetCode(username);
-    var data   = result.data;
+    // Fire both requests in parallel
+    var [solvedRes, submissionRes] = await Promise.all([
+      proxyGet('/' + encodeURIComponent(username) + '/solved'),
+      proxyGet('/' + encodeURIComponent(username) + '/submission'),
+    ]);
 
-    // Log for debugging
-    console.log('[LeetCode] matchedUser:', JSON.stringify(data?.data?.matchedUser).slice(0,100));
-    console.log('[LeetCode] recentAc:', JSON.stringify(data?.data?.recentAcSubmissionList).slice(0,100));
-
-    if (result.status === 429) {
-      return res.status(429).json({ error: 'LeetCode rate limit hit. Try again in a minute.' });
-    }
-
-    if (data?.errors) {
-      console.error('[LeetCode] GraphQL errors:', data.errors);
-    }
-
-    var matchedUser = data?.data?.matchedUser;
-    if (!matchedUser) {
+    // ── Solved stats ──────────────────────────────────────────────────────────
+    if (solvedRes.status === 404 || solvedRes.data?.errors) {
       return res.status(404).json({
         error: 'User "' + username + '" not found on LeetCode. Check the username exactly as shown on your profile.',
       });
     }
 
-    var stats  = matchedUser.submitStats?.acSubmissionNum || [];
-    var recent = data?.data?.recentAcSubmissionList || [];
+    var solved = solvedRes.data || {};
 
-    function getCount(diff) {
-      var s = stats.find(function(x) { return x.difficulty === diff; });
-      return s ? s.count : 0;
-    }
+    // ── Recent submissions ────────────────────────────────────────────────────
+    // Proxy returns { submission: [...] } — may be empty/missing if private
+    var rawSubs = submissionRes.data?.submission || [];
+    var recentSolved = rawSubs.map(function(s) {
+      return {
+        title:     s.title     || s.titleSlug || '',
+        slug:      s.titleSlug || '',
+        // proxy returns timestamp as unix seconds string or number
+        timestamp: parseInt(s.timestamp) * 1000,
+        lang:      s.lang || null,
+        status:    s.statusDisplay || null,
+      };
+    });
 
     res.json({
-      username:     matchedUser.username,
-      totalSolved:  getCount('All'),
-      easySolved:   getCount('Easy'),
-      mediumSolved: getCount('Medium'),
-      hardSolved:   getCount('Hard'),
-      recentSolved: recent.map(function(s) {
-        return {
-          title:     s.title,
-          slug:      s.titleSlug,
-          timestamp: parseInt(s.timestamp) * 1000,
-        };
-      }),
+      username:     username,
+      totalSolved:  solved.solvedProblem  || 0,
+      easySolved:   solved.easySolved     || 0,
+      mediumSolved: solved.mediumSolved   || 0,
+      hardSolved:   solved.hardSolved     || 0,
+      recentSolved: recentSolved,
     });
+
   } catch(e) {
-    console.error('[LeetCode] Error:', e.message);
-    res.status(503).json({ error: 'Could not reach LeetCode: ' + e.message });
+    console.error('[LeetCode proxy] Error:', e.message);
+
+    if (e.code === 429) {
+      return res.status(429).json({
+        error: 'LeetCode stats service is rate-limited. Please try again in a minute.',
+      });
+    }
+
+    // Proxy cold-start on Render can take ~30s — give the user a helpful message
+    if (e.message.includes('timed out')) {
+      return res.status(503).json({
+        error: 'LeetCode stats service is warming up. Please try again in 30 seconds.',
+      });
+    }
+
+    res.status(503).json({
+      error: 'Could not fetch LeetCode stats: ' + e.message,
+    });
   }
 });
 
