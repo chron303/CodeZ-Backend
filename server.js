@@ -1,6 +1,5 @@
 'use strict';
 
-// Load .env FIRST before anything else
 var dotenv = require('dotenv');
 var result = dotenv.config();
 if (result.error) {
@@ -22,6 +21,7 @@ var reviewNotifier   = require('./services/reviewNotifier');
 var aiRoute          = require('./routes/ai');
 var otpRoute         = require('./routes/otp');
 var premiumRoute     = require('./routes/premium');
+var mockRoute        = require('./routes/mock');
 
 var app  = express();
 var PORT = process.env.PORT || 4000;
@@ -51,6 +51,7 @@ app.use('/api/ai',       aiRoute);
 app.use('/api/otp',      otpRoute);
 app.use('/api/premium',  premiumRoute);
 app.use('/api/leetcode', leetcodeRoute);
+app.use('/api/mock',     mockRoute);
 
 app.get('/api/health', function(req, res) {
   res.json({ status: 'ok', time: new Date().toISOString() });
@@ -64,7 +65,7 @@ app.use(function(err, req, res, next) {
 app.listen(PORT, function() {
   console.log('DSA Quest API running on http://localhost:' + PORT);
 
-  // ── Cron 1: GitHub sync — daily at midnight IST ─────────────
+  // ── Cron 1: GitHub sync — midnight IST ──────────────────────
   cron.schedule('0 0 * * *', function() {
     console.log('[Cron] Running scheduled GitHub sync...');
     githubSync.syncFromGitHub()
@@ -76,32 +77,27 @@ app.listen(PORT, function() {
       });
   }, { timezone: 'Asia/Kolkata' });
 
-  console.log('[Cron] GitHub sync scheduled — runs daily at midnight IST');
-
-  // ── Cron 2: Review notifications — daily at 8am IST ─────────
+  // ── Cron 2: Review notifications — 8am IST ──────────────────
   cron.schedule('0 8 * * *', function() {
     console.log('[Cron] Running review notifications...');
     reviewNotifier.sendReviewNotifications()
       .then(function(result) {
-        console.log('[Cron] Review notifications done —',
+        console.log('[Cron] Notifications done —',
           result.sent, 'sent,', result.skipped, 'skipped,', result.errors, 'errors');
       })
       .catch(function(err) {
-        console.error('[Cron] Review notifications failed:', err.message);
+        console.error('[Cron] Notifications failed:', err.message);
       });
   }, { timezone: 'Asia/Kolkata' });
 
-  console.log('[Cron] Review notifications scheduled — runs daily at 8am IST');
+  console.log('[Cron] GitHub sync @ midnight IST | Review notifications @ 8am IST');
 
-  // ── Startup: GitHub sync ─────────────────────────────────────
+  // ── Startup sync ─────────────────────────────────────────────
   console.log('[Sync] Running initial sync on startup...');
   githubSync.syncFromGitHub()
     .then(function(log) {
       console.log('[Sync] Startup sync done:',
-        log.created, 'created,',
-        log.updated, 'updated,',
-        log.skipped, 'skipped'
-      );
+        log.created, 'created,', log.updated, 'updated,', log.skipped, 'skipped');
     })
     .catch(function(err) {
       console.error('[Sync] Startup sync failed:', err.message);
