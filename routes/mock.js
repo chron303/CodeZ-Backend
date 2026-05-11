@@ -392,16 +392,65 @@ router.post('/finish', async function(req, res) {
   var attempted = problems.filter(function(p) { return p.status !== 'pending'; }).length;
   var total     = problems.length;
 
-  // ── Ask Gemini to generate report ──────────────────────────
-  var problemSummary = problems.map(function(p) {
+  // ── Weighted scoring ───────────────────────────────────────
+  // Max marks per difficulty:  Easy = 5, Medium = 10, Hard = 15
+  // Partial credit: proportional to test cases passed.
+  // e.g. Hard problem with 3/5 test cases passed → (3/5) * 15 = 9 marks
+
+  var DIFF_MARKS = { Easy: 5, Medium: 10, Hard: 15 };
+
+  var totalMaxMarks = problems.reduce(function(sum, p) {
+    return sum + (DIFF_MARKS[p.difficulty] || 10);
+  }, 0);
+
+  // Per-problem scored marks + percentage for report
+  var problemScores = problems.map(function(p) {
+    var maxMarks  = DIFF_MARKS[p.difficulty] || 10;
+    var tcTotal   = p.total  || 0;
+    var tcPassed  = p.passed || 0;
+    var rawMarks  = tcTotal > 0
+      ? Math.round((tcPassed / tcTotal) * maxMarks)
+      : 0;
+    // Score as 0-100 percentage of this problem's max marks
+    var pctScore  = maxMarks > 0 ? Math.round((rawMarks / maxMarks) * 100) : 0;
     return {
       title:      p.title,
       topic:      p.topic,
       difficulty: p.difficulty,
       status:     p.status,
-      passed:     p.passed + '/' + p.total + ' test cases',
+      maxMarks,
+      rawMarks,
+      pctScore,
+      tcPassed,
+      tcTotal,
       verdict:    p.verdict || 'Not attempted',
       language:   p.language || 'Not submitted',
+    };
+  });
+
+  var totalEarned = problemScores.reduce(function(s, p) { return s + p.rawMarks; }, 0);
+  // Overall score as 0-100
+  var overallScore = totalMaxMarks > 0
+    ? Math.round((totalEarned / totalMaxMarks) * 100)
+    : 0;
+
+  var grade =
+    overallScore >= 90 ? 'S' :
+    overallScore >= 75 ? 'A' :
+    overallScore >= 60 ? 'B' :
+    overallScore >= 40 ? 'C' : 'D';
+
+  // ── Ask Gemini to generate narrative report ────────────────
+  // We pass the pre-calculated scores so Gemini doesn't override them.
+  var problemSummaryForGemini = problemScores.map(function(p) {
+    return {
+      title:      p.title,
+      topic:      p.topic,
+      difficulty: p.difficulty,
+      marks:      p.rawMarks + '/' + p.maxMarks,
+      testCases:  p.tcPassed + '/' + p.tcTotal + ' passed',
+      verdict:    p.verdict,
+      language:   p.language,
     };
   });
 
@@ -410,47 +459,94 @@ router.post('/finish', async function(req, res) {
     '',
     'Candidate level: ' + session.level,
     'Duration: ' + session.durationMins + ' minutes',
-    'Problems solved: ' + passed + '/' + total,
+    'Total score: ' + totalEarned + '/' + totalMaxMarks + ' marks (' + overallScore + '/100)',
+    'Problems fully solved: ' + passed + '/' + total,
     'Problems attempted: ' + attempted + '/' + total,
     '',
-    'Problem results:',
-    JSON.stringify(problemSummary, null, 2),
+    'Scoring system: Easy = 5 marks, Medium = 10 marks, Hard = 15 marks.',
+    'Partial credit is given proportional to test cases passed.',
     '',
-    'Generate a detailed report card. Respond ONLY with valid JSON:',
+    'Problem-by-problem results:',
+    JSON.stringify(problemSummaryForGemini, null, 2),
+    '',
+    'Generate narrative feedback. DO NOT change the scores — they are already calculated.',
+    'Respond ONLY with valid JSON (no markdown):',
     '{',
-    '  "overallScore": <number 0-100>,',
-    '  "grade": <"S"|"A"|"B"|"C"|"D">,',
-    '  "verdict": <"Excellent"|"Good"|"Average"|"Needs Improvement"|"Poor">,',
-    '  "summary": <2-3 sentence overall assessment>,',
-    '  "strengths": [<up to 3 specific strengths>],',
-    '  "improvements": [<up to 3 specific areas to improve>],',
-    '  "topicFeedback": { <topic>: <one line feedback> },',
-    '  "nextSteps": <one actionable recommendation>,',
+    '  "summary": "<2-3 sentence overall assessment>",',
+    '  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],',
+    '  "improvements": ["<area 1>", "<area 2>", "<area 3>"],',
+    '  "topicFeedback": { "<topic>": "<one line>" },',
+    '  "nextSteps": "<one actionable recommendation>",',
     '  "problemReports": [',
-    '    { "title": <title>, "feedback": <one sentence>, "score": <0-100> }',
+    '    { "title": "<title>", "feedback": "<one sentence specific to their performance>" }',
     '  ]',
     '}',
   ].join('\n');
 
   var report;
   try {
-    var raw = await gemini(reportPrompt);
-    report  = parseJSON(raw);
-  } catch(e) {
-    console.error('[Mock] Report generation failed:', e.message);
-    // Fallback report
-    var score = Math.round((passed / Math.max(total, 1)) * 100);
+    var raw      = await gemini(reportPrompt);
+    var narrative = parseJSON(raw);
+
+    // Merge Gemini narrative with our calculated scores
     report = {
-      overallScore: score,
-      grade:        score >= 90 ? 'S' : score >= 75 ? 'A' : score >= 60 ? 'B' : score >= 40 ? 'C' : 'D',
-      verdict:      score >= 75 ? 'Good' : score >= 50 ? 'Average' : 'Needs Improvement',
-      summary:      'You solved ' + passed + ' out of ' + total + ' problems.',
-      strengths:    passed > 0 ? ['Completed ' + passed + ' problem(s)'] : ['Attempted the assessment'],
-      improvements: ['Practice more problems across different topics'],
+      overallScore,
+      grade,
+      verdict:      overallScore >= 75 ? 'Excellent' : overallScore >= 60 ? 'Good' :
+                    overallScore >= 40 ? 'Average'   : overallScore >= 20 ? 'Needs Improvement' : 'Poor',
+      totalEarned,
+      totalMaxMarks,
+      summary:      narrative.summary      || '',
+      strengths:    narrative.strengths    || [],
+      improvements: narrative.improvements || [],
+      topicFeedback:narrative.topicFeedback|| {},
+      nextSteps:    narrative.nextSteps    || '',
+      // Merge per-problem narrative feedback with calculated scores
+      problemReports: problemScores.map(function(ps) {
+        var geminiP = (narrative.problemReports || []).find(function(gp) {
+          return gp.title === ps.title;
+        });
+        return {
+          title:      ps.title,
+          difficulty: ps.difficulty,
+          marks:      ps.rawMarks + '/' + ps.maxMarks,
+          score:      ps.pctScore,   // 0-100 for display bar
+          feedback:   geminiP ? geminiP.feedback : (
+            ps.tcPassed === ps.tcTotal && ps.tcTotal > 0
+              ? 'All test cases passed. Well done!'
+              : ps.tcPassed > 0
+              ? ps.tcPassed + '/' + ps.tcTotal + ' test cases passed. Partial credit awarded.'
+              : 'No test cases passed.'
+          ),
+        };
+      }),
+    };
+  } catch(e) {
+    console.error('[Mock] Gemini report generation failed:', e.message);
+    // Fallback — pure calculated scores, no narrative
+    report = {
+      overallScore,
+      grade,
+      verdict:      overallScore >= 75 ? 'Good' : overallScore >= 50 ? 'Average' : 'Needs Improvement',
+      totalEarned,
+      totalMaxMarks,
+      summary:      'You scored ' + totalEarned + '/' + totalMaxMarks + ' marks across ' + total + ' problems.',
+      strengths:    passed > 0 ? ['Solved ' + passed + ' problem(s) fully'] : ['Attempted the assessment'],
+      improvements: ['Review problems where test cases failed and practice similar questions'],
       topicFeedback:{},
-      nextSteps:    'Focus on your weak topics and attempt more mock interviews.',
-      problemReports: problems.map(function(p) {
-        return { title: p.title, feedback: p.status === 'passed' ? 'Solved correctly.' : 'Needs more practice.', score: p.status === 'passed' ? 100 : p.passed > 0 ? 50 : 0 };
+      nextSteps:    'Focus on your weakest topics and attempt another mock interview tomorrow.',
+      problemReports: problemScores.map(function(ps) {
+        return {
+          title:      ps.title,
+          difficulty: ps.difficulty,
+          marks:      ps.rawMarks + '/' + ps.maxMarks,
+          score:      ps.pctScore,
+          feedback:   ps.tcPassed === ps.tcTotal && ps.tcTotal > 0
+            ? 'All test cases passed.'
+            : ps.tcPassed > 0
+            ? ps.tcPassed + '/' + ps.tcTotal + ' test cases passed. Partial credit awarded.'
+            : 'No test cases passed.',
+        };
       }),
     };
   }
