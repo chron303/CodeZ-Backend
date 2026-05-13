@@ -1,20 +1,16 @@
 'use strict';
 
 // backend/routes/mock.js
-//
-// Mock Interview (Online Assessment Mode) — Premium only, 1 session/day
-//
-// POST /api/mock/start       — validate premium, pick problems via Gemini, create session
-// GET  /api/mock/session/:id — get current session state (for timer recovery)
-// POST /api/mock/submit      — submit code for one problem, run judge, store result
-// POST /api/mock/finish      — end session early or on timer expiry, generate report
-// GET  /api/mock/reports/:uid — list all past report cards for stats page
+// Mock Interview — Premium only, 1 session/day
+// All sensitive routes protected by Firebase ID token via verifyToken middleware.
+// uid is always taken from req.uid (verified token), never from request body.
 
-var express    = require('express');
-var https      = require('https');
-var router     = express.Router();
-var admin      = require('../firebaseAdmin');
-var langRunner = require('../services/langRunner');
+var express     = require('express');
+var https       = require('https');
+var router      = express.Router();
+var admin       = require('../firebaseAdmin');
+var langRunner  = require('../services/langRunner');
+var verifyToken = require('../middleware/verifyToken');
 
 var db           = admin.firestore();
 var GEMINI_KEY   = process.env.GEMINI_API_KEY || '';
@@ -63,112 +59,95 @@ function parseJSON(text) {
   return JSON.parse(clean);
 }
 
-// ─── Helpers ─────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────
 
 function todayIST() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 }
 
-// Duration map in minutes
 var DURATION_MAP = { '1hr': 60, '1.5hr': 90, '2hr': 120 };
 
-// Question count by duration + level
 function getQuestionCount(duration, level) {
   var base = duration === '1hr' ? 3 : duration === '1.5hr' ? 4 : 5;
   if (level === 'pro') base = Math.min(base + 1, 6);
   return base;
 }
 
-// Difficulty distribution by level
 function getDifficultyTarget(level) {
-  if (level === 'beginner') return { Easy: 2, Medium: 1, Hard: 0 };
+  if (level === 'beginner')     return { Easy: 2, Medium: 1, Hard: 0 };
   if (level === 'intermediate') return { Easy: 1, Medium: 2, Hard: 1 };
-  return { Easy: 0, Medium: 2, Hard: 2 }; // pro
+  return { Easy: 0, Medium: 2, Hard: 2 };
 }
+
+var DIFF_MARKS = { Easy: 5, Medium: 10, Hard: 15 };
 
 // ─── POST /api/mock/start ─────────────────────────────────────
 
-router.post('/start', async function(req, res) {
-  var { uid, level, duration } = req.body;
+router.post('/start', verifyToken, async function(req, res) {
+  var uid      = req.uid; // from verified token
+  var { level, duration } = req.body;
 
-  // ── Validate input ─────────────────────────────────────────
-  if (!uid) return res.status(400).json({ error: 'uid is required.' });
   if (!['beginner', 'intermediate', 'pro'].includes(level))
     return res.status(400).json({ error: 'level must be beginner, intermediate, or pro.' });
   if (!DURATION_MAP[duration])
     return res.status(400).json({ error: 'duration must be 1hr, 1.5hr, or 2hr.' });
 
-  // ── Premium check ──────────────────────────────────────────
+  // Premium check
   var userSnap = await db.collection('users').doc(uid).get();
   if (!userSnap.exists) return res.status(401).json({ error: 'User not found.' });
   var userData = userSnap.data();
   if (!userData.premium) return res.status(403).json({ error: 'Mock interviews require Premium.' });
   if (userData.premiumExpiresAt) {
-    var exp = userData.premiumExpiresAt.toDate ? userData.premiumExpiresAt.toDate() : new Date(userData.premiumExpiresAt);
+    var exp = userData.premiumExpiresAt.toDate
+      ? userData.premiumExpiresAt.toDate()
+      : new Date(userData.premiumExpiresAt);
     if (exp < new Date()) return res.status(403).json({ error: 'Your Premium subscription has expired.' });
   }
 
-  // ── 1 mock per day limit ───────────────────────────────────
-  var today = todayIST();
+  // 1 mock per day
+  var today     = todayIST();
   var usageRef  = db.collection('mockUsage').doc(uid);
   var usageSnap = await usageRef.get();
-  if (usageSnap.exists && usageSnap.data().date === today) {
+  if (usageSnap.exists && usageSnap.data().date === today)
     return res.status(429).json({ error: 'You can only take one mock interview per day. Come back tomorrow!' });
-  }
 
-  // ── Fetch all available problems ───────────────────────────
+  // Fetch problems
   var problemsSnap = await db.collection('problems').get();
-  var allProblems  = problemsSnap.docs.map(function(d) {
-    return { id: d.id, ...d.data() };
-  });
-
-  if (allProblems.length < 3) {
+  var allProblems  = problemsSnap.docs.map(function(d) { return { id: d.id, ...d.data() }; });
+  if (allProblems.length < 3)
     return res.status(400).json({ error: 'Not enough problems in the bank to run a mock interview.' });
-  }
 
-  // ── Fetch user's solve history ─────────────────────────────
+  // Solve history
   var progressSnap = await db.collection('userProgress').doc(uid).collection('problems').get();
-  var solvedIds    = new Set(progressSnap.docs.filter(d => d.data().solved).map(d => d.id));
+  var solvedIds    = new Set(progressSnap.docs.filter(function(d) { return d.data().solved; }).map(function(d) { return d.id; }));
 
-  // Build summary for Gemini
   var problemSummary = allProblems.map(function(p) {
-    return {
-      id:         p.id,
-      title:      p.title,
-      topic:      p.topic || 'General',
-      difficulty: p.difficulty || 'Medium',
-      solved:     solvedIds.has(p.id),
-    };
+    return { id: p.id, title: p.title, topic: p.topic || 'General', difficulty: p.difficulty || 'Medium', solved: solvedIds.has(p.id) };
   });
 
   var targetCount = getQuestionCount(duration, level);
   var diffTarget  = getDifficultyTarget(level);
-
-  // ── Ask Gemini to pick problems ────────────────────────────
-  // Randomness seed in prompt ensures variety
-  var seed = Math.floor(Math.random() * 10000);
+  var seed        = Math.floor(Math.random() * 10000);
 
   var pickPrompt = [
     'You are selecting problems for a coding interview assessment.',
-    '',
     'Candidate level: ' + level,
     'Duration: ' + duration + ' (' + DURATION_MAP[duration] + ' minutes)',
     'Target problems: ' + targetCount,
     'Target difficulty: Easy=' + diffTarget.Easy + ', Medium=' + diffTarget.Medium + ', Hard=' + diffTarget.Hard,
     'Randomness seed (use this to vary selections): ' + seed,
     '',
-    'Available problems (JSON array):',
+    'Available problems:',
     JSON.stringify(problemSummary),
     '',
     'Rules:',
     '1. Pick exactly ' + targetCount + ' problems.',
-    '2. Prefer UNSOLVED problems first — only reuse solved ones if not enough unsolved.',
+    '2. Prefer UNSOLVED problems first.',
     '3. Aim for the difficulty distribution above.',
-    '4. Spread across different topics where possible.',
-    '5. Use the seed to randomize — different seeds must produce different selections.',
-    '6. Do NOT pick the same problem twice.',
+    '4. Spread across different topics.',
+    '5. Use the seed to randomize selections.',
     '',
-    'Respond ONLY with a JSON array of problem IDs, nothing else. Example: ["id1","id2","id3"]',
+    'Respond ONLY with a JSON array of problem IDs. Example: ["id1","id2","id3"]',
   ].join('\n');
 
   var selectedIds;
@@ -176,25 +155,19 @@ router.post('/start', async function(req, res) {
     var raw = await gemini(pickPrompt);
     selectedIds = parseJSON(raw);
     if (!Array.isArray(selectedIds) || selectedIds.length === 0) throw new Error('Bad response');
-    // Trim to targetCount in case Gemini over-selects
     selectedIds = selectedIds.slice(0, targetCount);
   } catch(e) {
-    console.error('[Mock] Gemini problem pick failed:', e.message, '— falling back to random');
-    // Fallback: random selection respecting difficulty targets
+    console.error('[Mock] Gemini pick failed:', e.message, '— falling back to random');
     var byDiff = { Easy: [], Medium: [], Hard: [] };
     allProblems.forEach(function(p) {
       var d = p.difficulty || 'Medium';
       if (byDiff[d]) byDiff[d].push(p);
     });
-    // Shuffle each bucket
-    Object.keys(byDiff).forEach(function(d) {
-      byDiff[d].sort(function() { return Math.random() - 0.5; });
-    });
+    Object.keys(byDiff).forEach(function(d) { byDiff[d].sort(function() { return Math.random() - 0.5; }); });
     var picked = [];
     Object.entries(diffTarget).forEach(function([diff, count]) {
       byDiff[diff].slice(0, count).forEach(function(p) { picked.push(p.id); });
     });
-    // Fill remaining if needed
     if (picked.length < targetCount) {
       allProblems
         .filter(function(p) { return !picked.includes(p.id); })
@@ -205,75 +178,52 @@ router.post('/start', async function(req, res) {
     selectedIds = picked.slice(0, targetCount);
   }
 
-  // Resolve full problem objects
   var selectedProblems = selectedIds
     .map(function(id) { return allProblems.find(function(p) { return p.id === id; }); })
     .filter(Boolean)
     .map(function(p) {
       return {
-        id:          p.id,
-        title:       p.title,
-        topic:       p.topic || 'General',
-        difficulty:  p.difficulty || 'Medium',
-        description: p.description || '',
-        testCases:   (p.testCases || []).filter(function(tc) { return !tc.hidden; }),
-        url:         p.url || null,
-        status:      'pending', // pending | attempted | passed | failed
-        code:        '',
-        language:    'python',
-        passed:      0,
-        total:       (p.testCases || []).filter(function(tc) { return !tc.hidden; }).length,
-        timeMs:      null,
+        id: p.id, title: p.title, topic: p.topic || 'General',
+        difficulty: p.difficulty || 'Medium', description: p.description || '',
+        testCases: (p.testCases || []).filter(function(tc) { return !tc.hidden; }),
+        url: p.url || null, status: 'pending', code: '', language: 'python',
+        passed: 0, total: (p.testCases || []).filter(function(tc) { return !tc.hidden; }).length,
+        timeMs: null,
       };
     });
 
-  if (selectedProblems.length === 0) {
+  if (selectedProblems.length === 0)
     return res.status(500).json({ error: 'Could not resolve selected problems.' });
-  }
 
-  // ── Create Firestore session ───────────────────────────────
   var durationMins = DURATION_MAP[duration];
-  var now     = new Date();
-  var endsAt  = new Date(now.getTime() + durationMins * 60 * 1000);
+  var now    = new Date();
+  var endsAt = new Date(now.getTime() + durationMins * 60 * 1000);
 
-  var sessionRef  = db.collection('mockSessions').doc();
-  var sessionId   = sessionRef.id;
+  var sessionRef = db.collection('mockSessions').doc();
+  var sessionId  = sessionRef.id;
 
   await sessionRef.set({
-    uid,
-    level,
-    duration,
-    durationMins,
-    startedAt:  admin.firestore.Timestamp.fromDate(now),
-    endsAt:     admin.firestore.Timestamp.fromDate(endsAt),
-    problems:   selectedProblems,
-    status:     'active',
-    report:     null,
-    createdAt:  admin.firestore.FieldValue.serverTimestamp(),
+    uid, level, duration, durationMins,
+    startedAt: admin.firestore.Timestamp.fromDate(now),
+    endsAt:    admin.firestore.Timestamp.fromDate(endsAt),
+    problems:  selectedProblems,
+    status:    'active',
+    report:    null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  // ── Mark usage for today ───────────────────────────────────
   await usageRef.set({ date: today, sessionId });
 
-  console.log('[Mock] Session started:', sessionId, '| uid:', uid, '| level:', level, '| problems:', selectedProblems.length);
+  console.log('[Mock] Session started:', sessionId, '| uid:', uid, '| level:', level);
 
-  res.json({
-    sessionId,
-    endsAt:   endsAt.toISOString(),
-    durationMins,
-    problems: selectedProblems,
-    level,
-  });
+  res.json({ sessionId, endsAt: endsAt.toISOString(), durationMins, problems: selectedProblems, level });
 });
 
 // ─── GET /api/mock/session/:sessionId ─────────────────────────
-// Used on page reload to recover timer and state
 
-router.get('/session/:sessionId', async function(req, res) {
-  var { sessionId } = req.params;
-  var { uid }       = req.query;
-
-  if (!uid) return res.status(400).json({ error: 'uid required' });
+router.get('/session/:sessionId', verifyToken, async function(req, res) {
+  var uid       = req.uid;
+  var sessionId = req.params.sessionId;
 
   var snap = await db.collection('mockSessions').doc(sessionId).get();
   if (!snap.exists) return res.status(404).json({ error: 'Session not found.' });
@@ -281,7 +231,6 @@ router.get('/session/:sessionId', async function(req, res) {
   var session = snap.data();
   if (session.uid !== uid) return res.status(403).json({ error: 'Access denied.' });
 
-  // Auto-finish if timer expired
   if (session.status === 'active') {
     var endsAt = session.endsAt.toDate();
     if (new Date() > endsAt) {
@@ -291,52 +240,45 @@ router.get('/session/:sessionId', async function(req, res) {
   }
 
   res.json({
-    sessionId,
-    status:      session.status,
-    endsAt:      session.endsAt.toDate().toISOString(),
-    durationMins:session.durationMins,
-    problems:    session.problems,
-    level:       session.level,
-    report:      session.report || null,
+    sessionId, status: session.status,
+    endsAt:       session.endsAt.toDate().toISOString(),
+    durationMins: session.durationMins,
+    problems:     session.problems,
+    level:        session.level,
+    report:       session.report || null,
   });
 });
 
 // ─── POST /api/mock/submit ────────────────────────────────────
-// Run code for one problem and store result in session
 
-router.post('/submit', async function(req, res) {
-  var { uid, sessionId, problemId, code, language } = req.body;
+router.post('/submit', verifyToken, async function(req, res) {
+  var uid = req.uid;
+  var { sessionId, problemId, code, language } = req.body;
 
-  if (!uid || !sessionId || !problemId || !code)
-    return res.status(400).json({ error: 'uid, sessionId, problemId, code required.' });
+  if (!sessionId || !problemId || !code)
+    return res.status(400).json({ error: 'sessionId, problemId, code required.' });
 
   var snap = await db.collection('mockSessions').doc(sessionId).get();
   if (!snap.exists) return res.status(404).json({ error: 'Session not found.' });
 
   var session = snap.data();
-  if (session.uid !== uid) return res.status(403).json({ error: 'Access denied.' });
+  if (session.uid !== uid)       return res.status(403).json({ error: 'Access denied.' });
   if (session.status !== 'active') return res.status(400).json({ error: 'Session is not active.' });
 
-  // Check timer hasn't expired
   var endsAt = session.endsAt.toDate();
   if (new Date() > endsAt) {
     await db.collection('mockSessions').doc(sessionId).update({ status: 'finished' });
     return res.status(400).json({ error: 'Time is up! Session has ended.' });
   }
 
-  // Find problem in session
   var problems = session.problems || [];
   var pIdx     = problems.findIndex(function(p) { return p.id === problemId; });
   if (pIdx === -1) return res.status(404).json({ error: 'Problem not in this session.' });
 
   var problem   = problems[pIdx];
   var testCases = problem.testCases || [];
+  if (testCases.length === 0) return res.status(400).json({ error: 'No test cases for this problem.' });
 
-  if (testCases.length === 0) {
-    return res.status(400).json({ error: 'No test cases for this problem.' });
-  }
-
-  // ── Run code ───────────────────────────────────────────────
   var judgeResult;
   try {
     judgeResult = await langRunner.runTests(language || 'python', code, testCases);
@@ -344,16 +286,13 @@ router.post('/submit', async function(req, res) {
     return res.status(500).json({ error: 'Execution error: ' + e.message });
   }
 
-  // ── Update problem in session ──────────────────────────────
   problems[pIdx] = {
-    ...problem,
-    code,
-    language:   language || 'python',
-    passed:     judgeResult.passed,
-    total:      judgeResult.total,
-    status:     judgeResult.allPassed ? 'passed' : 'attempted',
-    timeMs:     judgeResult.results.reduce(function(s, r) { return s + (r.timeMs || 0); }, 0),
-    verdict:    judgeResult.verdict,
+    ...problem, code, language: language || 'python',
+    passed:  judgeResult.passed,
+    total:   judgeResult.total,
+    status:  judgeResult.allPassed ? 'passed' : 'attempted',
+    timeMs:  judgeResult.results.reduce(function(s, r) { return s + (r.timeMs || 0); }, 0),
+    verdict: judgeResult.verdict,
     lastSubmit: new Date().toISOString(),
   };
 
@@ -369,12 +308,12 @@ router.post('/submit', async function(req, res) {
 });
 
 // ─── POST /api/mock/finish ────────────────────────────────────
-// End session + generate Gemini report card
 
-router.post('/finish', async function(req, res) {
-  var { uid, sessionId } = req.body;
+router.post('/finish', verifyToken, async function(req, res) {
+  var uid       = req.uid;
+  var { sessionId } = req.body;
 
-  if (!uid || !sessionId) return res.status(400).json({ error: 'uid and sessionId required.' });
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required.' });
 
   var ref  = db.collection('mockSessions').doc(sessionId);
   var snap = await ref.get();
@@ -382,176 +321,99 @@ router.post('/finish', async function(req, res) {
 
   var session = snap.data();
   if (session.uid !== uid) return res.status(403).json({ error: 'Access denied.' });
-  if (session.report) {
-    // Already finished — return existing report
-    return res.json({ report: session.report, sessionId });
-  }
+  if (session.report) return res.json({ report: session.report, sessionId });
 
   var problems  = session.problems || [];
   var passed    = problems.filter(function(p) { return p.status === 'passed'; }).length;
   var attempted = problems.filter(function(p) { return p.status !== 'pending'; }).length;
   var total     = problems.length;
 
-  // ── Weighted scoring ───────────────────────────────────────
-  // Max marks per difficulty:  Easy = 5, Medium = 10, Hard = 15
-  // Partial credit: proportional to test cases passed.
-  // e.g. Hard problem with 3/5 test cases passed → (3/5) * 15 = 9 marks
-
-  var DIFF_MARKS = { Easy: 5, Medium: 10, Hard: 15 };
-
+  // Weighted scoring
   var totalMaxMarks = problems.reduce(function(sum, p) {
     return sum + (DIFF_MARKS[p.difficulty] || 10);
   }, 0);
 
-  // Per-problem scored marks + percentage for report
   var problemScores = problems.map(function(p) {
-    var maxMarks  = DIFF_MARKS[p.difficulty] || 10;
-    var tcTotal   = p.total  || 0;
-    var tcPassed  = p.passed || 0;
-    var rawMarks  = tcTotal > 0
-      ? Math.round((tcPassed / tcTotal) * maxMarks)
-      : 0;
-    // Score as 0-100 percentage of this problem's max marks
-    var pctScore  = maxMarks > 0 ? Math.round((rawMarks / maxMarks) * 100) : 0;
-    return {
-      title:      p.title,
-      topic:      p.topic,
-      difficulty: p.difficulty,
-      status:     p.status,
-      maxMarks,
-      rawMarks,
-      pctScore,
-      tcPassed,
-      tcTotal,
-      verdict:    p.verdict || 'Not attempted',
-      language:   p.language || 'Not submitted',
-    };
+    var maxMarks = DIFF_MARKS[p.difficulty] || 10;
+    var tcTotal  = p.total  || 0;
+    var tcPassed = p.passed || 0;
+    var rawMarks = tcTotal > 0 ? Math.round((tcPassed / tcTotal) * maxMarks) : 0;
+    var pctScore = maxMarks > 0 ? Math.round((rawMarks / maxMarks) * 100) : 0;
+    return { title: p.title, topic: p.topic, difficulty: p.difficulty, status: p.status,
+      maxMarks, rawMarks, pctScore, tcPassed, tcTotal, verdict: p.verdict || 'Not attempted',
+      language: p.language || 'Not submitted' };
   });
 
-  var totalEarned = problemScores.reduce(function(s, p) { return s + p.rawMarks; }, 0);
-  // Overall score as 0-100
-  var overallScore = totalMaxMarks > 0
-    ? Math.round((totalEarned / totalMaxMarks) * 100)
-    : 0;
+  var totalEarned  = problemScores.reduce(function(s, p) { return s + p.rawMarks; }, 0);
+  var overallScore = totalMaxMarks > 0 ? Math.round((totalEarned / totalMaxMarks) * 100) : 0;
+  var grade = overallScore >= 90 ? 'S' : overallScore >= 75 ? 'A' :
+              overallScore >= 60 ? 'B' : overallScore >= 40 ? 'C' : 'D';
 
-  var grade =
-    overallScore >= 90 ? 'S' :
-    overallScore >= 75 ? 'A' :
-    overallScore >= 60 ? 'B' :
-    overallScore >= 40 ? 'C' : 'D';
-
-  // ── Ask Gemini to generate narrative report ────────────────
-  // We pass the pre-calculated scores so Gemini doesn't override them.
   var problemSummaryForGemini = problemScores.map(function(p) {
-    return {
-      title:      p.title,
-      topic:      p.topic,
-      difficulty: p.difficulty,
-      marks:      p.rawMarks + '/' + p.maxMarks,
-      testCases:  p.tcPassed + '/' + p.tcTotal + ' passed',
-      verdict:    p.verdict,
-      language:   p.language,
-    };
+    return { title: p.title, topic: p.topic, difficulty: p.difficulty,
+      marks: p.rawMarks + '/' + p.maxMarks, testCases: p.tcPassed + '/' + p.tcTotal + ' passed',
+      verdict: p.verdict, language: p.language };
   });
 
   var reportPrompt = [
     'You are a senior interviewer generating a mock interview report card.',
-    '',
     'Candidate level: ' + session.level,
     'Duration: ' + session.durationMins + ' minutes',
     'Total score: ' + totalEarned + '/' + totalMaxMarks + ' marks (' + overallScore + '/100)',
     'Problems fully solved: ' + passed + '/' + total,
     'Problems attempted: ' + attempted + '/' + total,
+    'Scoring: Easy=5, Medium=10, Hard=15 marks. Partial credit proportional to test cases passed.',
     '',
-    'Scoring system: Easy = 5 marks, Medium = 10 marks, Hard = 15 marks.',
-    'Partial credit is given proportional to test cases passed.',
-    '',
-    'Problem-by-problem results:',
+    'Problem results:',
     JSON.stringify(problemSummaryForGemini, null, 2),
     '',
-    'Generate narrative feedback. DO NOT change the scores — they are already calculated.',
+    'Generate narrative feedback only. DO NOT change the scores.',
     'Respond ONLY with valid JSON (no markdown):',
-    '{',
-    '  "summary": "<2-3 sentence overall assessment>",',
-    '  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],',
-    '  "improvements": ["<area 1>", "<area 2>", "<area 3>"],',
-    '  "topicFeedback": { "<topic>": "<one line>" },',
-    '  "nextSteps": "<one actionable recommendation>",',
-    '  "problemReports": [',
-    '    { "title": "<title>", "feedback": "<one sentence specific to their performance>" }',
-    '  ]',
-    '}',
+    '{"summary":"<2-3 sentences>","strengths":["<s1>","<s2>","<s3>"],"improvements":["<i1>","<i2>","<i3>"],"topicFeedback":{"<topic>":"<one line>"},"nextSteps":"<one actionable recommendation>","problemReports":[{"title":"<title>","feedback":"<one sentence>"}]}',
   ].join('\n');
 
   var report;
   try {
-    var raw      = await gemini(reportPrompt);
+    var raw       = await gemini(reportPrompt);
     var narrative = parseJSON(raw);
-
-    // Merge Gemini narrative with our calculated scores
     report = {
-      overallScore,
-      grade,
-      verdict:      overallScore >= 75 ? 'Excellent' : overallScore >= 60 ? 'Good' :
-                    overallScore >= 40 ? 'Average'   : overallScore >= 20 ? 'Needs Improvement' : 'Poor',
-      totalEarned,
-      totalMaxMarks,
-      summary:      narrative.summary      || '',
-      strengths:    narrative.strengths    || [],
-      improvements: narrative.improvements || [],
-      topicFeedback:narrative.topicFeedback|| {},
-      nextSteps:    narrative.nextSteps    || '',
-      // Merge per-problem narrative feedback with calculated scores
+      overallScore, grade, totalEarned, totalMaxMarks,
+      verdict: overallScore >= 75 ? 'Excellent' : overallScore >= 60 ? 'Good' :
+               overallScore >= 40 ? 'Average'   : overallScore >= 20 ? 'Needs Improvement' : 'Poor',
+      summary:       narrative.summary       || '',
+      strengths:     narrative.strengths     || [],
+      improvements:  narrative.improvements  || [],
+      topicFeedback: narrative.topicFeedback || {},
+      nextSteps:     narrative.nextSteps     || '',
       problemReports: problemScores.map(function(ps) {
-        var geminiP = (narrative.problemReports || []).find(function(gp) {
-          return gp.title === ps.title;
-        });
+        var geminiP = (narrative.problemReports || []).find(function(gp) { return gp.title === ps.title; });
         return {
-          title:      ps.title,
-          difficulty: ps.difficulty,
-          marks:      ps.rawMarks + '/' + ps.maxMarks,
-          score:      ps.pctScore,   // 0-100 for display bar
-          feedback:   geminiP ? geminiP.feedback : (
-            ps.tcPassed === ps.tcTotal && ps.tcTotal > 0
-              ? 'All test cases passed. Well done!'
-              : ps.tcPassed > 0
-              ? ps.tcPassed + '/' + ps.tcTotal + ' test cases passed. Partial credit awarded.'
-              : 'No test cases passed.'
-          ),
+          title: ps.title, difficulty: ps.difficulty,
+          marks: ps.rawMarks + '/' + ps.maxMarks, score: ps.pctScore,
+          feedback: geminiP ? geminiP.feedback :
+            ps.tcPassed === ps.tcTotal && ps.tcTotal > 0 ? 'All test cases passed. Well done!' :
+            ps.tcPassed > 0 ? ps.tcPassed + '/' + ps.tcTotal + ' test cases passed.' : 'No test cases passed.',
         };
       }),
     };
   } catch(e) {
-    console.error('[Mock] Gemini report generation failed:', e.message);
-    // Fallback — pure calculated scores, no narrative
+    console.error('[Mock] Report generation failed:', e.message);
     report = {
-      overallScore,
-      grade,
-      verdict:      overallScore >= 75 ? 'Good' : overallScore >= 50 ? 'Average' : 'Needs Improvement',
-      totalEarned,
-      totalMaxMarks,
-      summary:      'You scored ' + totalEarned + '/' + totalMaxMarks + ' marks across ' + total + ' problems.',
+      overallScore, grade, totalEarned, totalMaxMarks,
+      verdict: overallScore >= 75 ? 'Good' : overallScore >= 50 ? 'Average' : 'Needs Improvement',
+      summary: 'You scored ' + totalEarned + '/' + totalMaxMarks + ' marks.',
       strengths:    passed > 0 ? ['Solved ' + passed + ' problem(s) fully'] : ['Attempted the assessment'],
-      improvements: ['Review problems where test cases failed and practice similar questions'],
-      topicFeedback:{},
-      nextSteps:    'Focus on your weakest topics and attempt another mock interview tomorrow.',
+      improvements: ['Review problems where test cases failed'],
+      topicFeedback: {}, nextSteps: 'Focus on weak topics and attempt another mock interview tomorrow.',
       problemReports: problemScores.map(function(ps) {
-        return {
-          title:      ps.title,
-          difficulty: ps.difficulty,
-          marks:      ps.rawMarks + '/' + ps.maxMarks,
-          score:      ps.pctScore,
-          feedback:   ps.tcPassed === ps.tcTotal && ps.tcTotal > 0
-            ? 'All test cases passed.'
-            : ps.tcPassed > 0
-            ? ps.tcPassed + '/' + ps.tcTotal + ' test cases passed. Partial credit awarded.'
-            : 'No test cases passed.',
-        };
+        return { title: ps.title, difficulty: ps.difficulty,
+          marks: ps.rawMarks + '/' + ps.maxMarks, score: ps.pctScore,
+          feedback: ps.tcPassed === ps.tcTotal && ps.tcTotal > 0 ? 'All test cases passed.' :
+            ps.tcPassed > 0 ? ps.tcPassed + '/' + ps.tcTotal + ' test cases passed.' : 'No test cases passed.' };
       }),
     };
   }
 
-  // Add metadata
   report.sessionId    = sessionId;
   report.level        = session.level;
   report.duration     = session.duration;
@@ -561,41 +423,27 @@ router.post('/finish', async function(req, res) {
   report.finishedAt   = new Date().toISOString();
   report.startedAt    = session.startedAt.toDate().toISOString();
 
-  // ── Save report to session + user reports collection ───────
   await ref.update({ status: 'finished', report });
-
-  await db
-    .collection('mockReports')
-    .doc(uid)
-    .collection('reports')
-    .doc(sessionId)
-    .set(report);
+  await db.collection('mockReports').doc(uid).collection('reports').doc(sessionId).set(report);
 
   console.log('[Mock] Session finished:', sessionId, '| score:', report.overallScore);
   res.json({ report, sessionId });
 });
 
 // ─── GET /api/mock/reports/:uid ───────────────────────────────
+// uid in URL must match the authenticated user
 
-router.get('/reports/:uid', async function(req, res) {
-  var { uid }      = req.params;
-  var { requester } = req.query;
+router.get('/reports/:uid', verifyToken, async function(req, res) {
+  var tokenUid = req.uid;
+  var paramUid = req.params.uid;
 
-  if (requester !== uid) return res.status(403).json({ error: 'Access denied.' });
+  if (tokenUid !== paramUid)
+    return res.status(403).json({ error: 'Access denied.' });
 
-  var snap = await db
-    .collection('mockReports')
-    .doc(uid)
-    .collection('reports')
-    .orderBy('finishedAt', 'desc')
-    .limit(20)
-    .get();
+  var snap = await db.collection('mockReports').doc(tokenUid)
+    .collection('reports').orderBy('finishedAt', 'desc').limit(20).get();
 
-  var reports = snap.docs.map(function(d) {
-    return { id: d.id, ...d.data() };
-  });
-
-  res.json({ reports });
+  res.json({ reports: snap.docs.map(function(d) { return { id: d.id, ...d.data() }; }) });
 });
 
 module.exports = router;
