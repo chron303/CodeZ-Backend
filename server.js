@@ -92,14 +92,16 @@ app.listen(PORT, function() {
 
   console.log('[Cron] GitHub sync @ midnight IST | Review notifications @ 8am IST');
 
-  // ── Startup sync ─────────────────────────────────────────────
-  console.log('[Sync] Running initial sync on startup...');
-  githubSync.syncFromGitHub()
-    .then(function(log) {
-      console.log('[Sync] Startup sync done:',
-        log.created, 'created,', log.updated, 'updated,', log.skipped, 'skipped');
-    })
-    .catch(function(err) {
-      console.error('[Sync] Startup sync failed:', err.message);
-    });
+  // ── Startup sync — delayed 3s so Firebase Admin fully initializes ──
+  setTimeout(function() {
+    console.log('[Sync] Running initial sync on startup...');
+    githubSync.syncFromGitHub()
+      .then(function(log) {
+        console.log('[Sync] Startup sync done:',
+          log.created, 'created,', log.updated, 'updated,', log.skipped, 'skipped');
+      })
+      .catch(function(err) {
+        console.error('[Sync] Startup sync failed:', err.message);
+      });
+  }, 3000);
 });
